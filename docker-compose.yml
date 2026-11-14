@@ -12,8 +12,7 @@ services:
       DATABASE_PATH: /data/radar.db
       TZ: ${TZ:-Asia/Shanghai}
     env_file:
-      - path: .env
-        required: false
+      - .env
     volumes:
       - ./data:/data
     logging:
