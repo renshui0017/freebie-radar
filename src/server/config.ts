@@ -68,6 +68,12 @@ export const config = {
   ingestToken: str("INGEST_TOKEN"),
   /** 管理端密码；留空则管理接口全部开放（向后兼容） */
   adminToken: str("ADMIN_TOKEN"),
+  /** 通用媒体中转（relay.ts）：五项齐全才启用，缺项则端点不存在 */
+  relayKey: str("RELAY_KEY"),
+  relayPath: str("RELAY_PATH"),
+  relayUpstream: str("RELAY_UPSTREAM"),
+  relayPageTmpl: str("RELAY_PAGE_TMPL"),
+  relayDefsKey: str("RELAY_DEFS_KEY"),
 } as const;
 
 export const aiEnabled = Boolean(config.aiBaseUrl && config.aiModel);
