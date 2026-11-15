@@ -165,32 +165,42 @@ export function registerRelay(app: Hono): void {
     // 4. 取流（同进程同出口 IP，与第 3 步一致），流式透传
     const mediaHeaders: Record<string, string> = { "User-Agent": UA, Referer: upstream + "/" };
     if (range) mediaHeaders["Range"] = range;
-        // phncdn 限制 Range 起点相对已送达位置的跳跃幅度（实测：60MB 跳跃返回 416，
-        // 10MB 步进正常；同一文件+IP 下渐进请求 20M→100M 全部 206）：大起点先以
-        // 小步 Range 探针“走”上去，每步只取 1 字节，探针失败即停（尽力而为）。
-        const rangeStart = /^bytes=(\d+)-/.exec(range || "");
-        const startPos = rangeStart ? parseInt(rangeStart[1] ?? "0", 10) : 0;
-        if (startPos > RANGE_STEP) {
-                for (let pos = RANGE_STEP; pos < startPos; pos += RANGE_STEP) {
-                          try {
-                                      const probe = await fetch(mediaUrl, {
-                                                    headers: { "User-Agent": UA, Referer: upstream + "/", Range: `bytes=${pos}-${pos}` },
-                                                    signal: AbortSignal.timeout(PAGE_TIMEOUT_MS),
-                                                    redirect: "follow",
-                                      });
-                                      await probe.arrayBuffer().catch(() => undefined);
-                                      if (probe.status !== 206) break;
-                          } catch {
-                                      break;
-                          }
-                }
+    // phncdn 限制 Range 起点相对已送达位置的跳跃幅度（实测：60MB 跳跃返回 416，
+    // 10MB 步进正常；同一文件+IP 下渐进请求 20M→100M 全部 206）：大起点先以
+    // 小步 Range 探针“走”上去，每步只取 1 字节，探针失败即停（尽力而为）。
+    // 416 是边缘节点状态依赖的偶发失败（同一视频同一偏移可连续 10 次成功也可偶发
+    // 416）：最终取流 416 时重走一遍探针再取，最多 3 次；3 次都 416 则原样返回。
+    const rangeStart = /^bytes=(\d+)-/.exec(range || "");
+    const startPos = rangeStart ? parseInt(rangeStart[1] ?? "0", 10) : 0;
+    const walk = async () => {
+      if (startPos <= RANGE_STEP) return;
+      for (let pos = RANGE_STEP; pos < startPos; pos += RANGE_STEP) {
+        try {
+          const probe = await fetch(mediaUrl, {
+            headers: { "User-Agent": UA, Referer: upstream + "/", Range: `bytes=${pos}-${pos}` },
+            signal: AbortSignal.timeout(PAGE_TIMEOUT_MS),
+            redirect: "follow",
+          });
+          await probe.arrayBuffer().catch(() => undefined);
+          if (probe.status !== 206) break;
+        } catch {
+          break;
         }
-    let up: Response;
-    try {
-      up = await fetch(mediaUrl, { headers: mediaHeaders, redirect: "follow" });
-    } catch {
-      return fail("stream");
+      }
+    };
+    let up: Response | null = null;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      await walk();
+      try {
+        up = await fetch(mediaUrl, { headers: mediaHeaders, redirect: "follow" });
+      } catch {
+        up = null;
+      }
+      if (up && up.status !== 416) break;
+      if (up) await up.arrayBuffer().catch(() => undefined);
+      if (attempt < 2) await new Promise((r) => setTimeout(r, 1000));
     }
+    if (!up) return fail("stream");
     const headers = new Headers();
     for (const name of ["content-type", "content-length", "content-range", "accept-ranges"]) {
       const v = up.headers.get(name);
