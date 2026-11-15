@@ -18,6 +18,7 @@ import { config } from "./config.ts";
 const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 const PAGE_TIMEOUT_MS = 20_000;
+const RANGE_STEP = 8 * 1024 * 1024; // Range 大起点探针步进（见第 4 步注释）
 const QUALITY_ORDER: Record<string, number> = { "720": 0, "480": 1, "1080": 2, "240": 3 };
 
 type MediaDef = { format?: string; quality?: string | number; videoUrl?: string };
@@ -164,6 +165,26 @@ export function registerRelay(app: Hono): void {
     // 4. 取流（同进程同出口 IP，与第 3 步一致），流式透传
     const mediaHeaders: Record<string, string> = { "User-Agent": UA, Referer: upstream + "/" };
     if (range) mediaHeaders["Range"] = range;
+        // phncdn 限制 Range 起点相对已送达位置的跳跃幅度（实测：60MB 跳跃返回 416，
+        // 10MB 步进正常；同一文件+IP 下渐进请求 20M→100M 全部 206）：大起点先以
+        // 小步 Range 探针“走”上去，每步只取 1 字节，探针失败即停（尽力而为）。
+        const rangeStart = /^bytes=(\d+)-/.exec(range || "");
+        const startPos = rangeStart ? parseInt(rangeStart[1] ?? "0", 10) : 0;
+        if (startPos > RANGE_STEP) {
+                for (let pos = RANGE_STEP; pos < startPos; pos += RANGE_STEP) {
+                          try {
+                                      const probe = await fetch(mediaUrl, {
+                                                    headers: { "User-Agent": UA, Referer: upstream + "/", Range: `bytes=${pos}-${pos}` },
+                                                    signal: AbortSignal.timeout(PAGE_TIMEOUT_MS),
+                                                    redirect: "follow",
+                                      });
+                                      await probe.arrayBuffer().catch(() => undefined);
+                                      if (probe.status !== 206) break;
+                          } catch {
+                                      break;
+                          }
+                }
+        }
     let up: Response;
     try {
       up = await fetch(mediaUrl, { headers: mediaHeaders, redirect: "follow" });
