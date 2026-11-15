@@ -8,6 +8,7 @@ import { logger } from "hono/logger";
 import { config } from "./config.ts";
 import { getDb, migrate, run } from "./db.ts";
 import { registerApi } from "./routes.ts";
+import { registerRelay } from "./relay.ts";
 import { startPushScheduler } from "./push.ts";
 import { digestExists, runDaily } from "./digest.ts";
 import { startIntervalScheduler, startScheduler } from "./cron.ts";
@@ -36,6 +37,7 @@ app.get("/health", (c) => {
 });
 
 registerApi(app);
+registerRelay(app);
 
 // Hono 的 serveStatic 的 root/path 都相对 process.cwd()，传绝对路径会拼出错误路径；
 // 另外带 hash 的 assets 应该长缓存，index.html 必须 no-store，否则发版后用户会拿到旧 HTML 白屏。
