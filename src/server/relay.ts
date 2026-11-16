@@ -11,6 +11,8 @@
 // 五项缺任何一项，端点不注册（当它不存在）。
 // 鉴权失败返回 404（不暴露端点存在）；鉴权通过后的上游失败返回 502 + 步骤码。
 // 日志里不记录请求参数。
+// 安全加固（2026-11-16）：第 3、4 步的上游 URL 来自页面内容，须过域名白名单
+// （pornhub.com / phncdn.com 后缀，拒裸 IP 与内网地址），重定向每跳都校验。
 
 import type { Hono } from "hono";
 import { config } from "./config.ts";
@@ -27,6 +29,61 @@ function enabled(): boolean {
   return Boolean(
     config.relayKey && config.relayPath && config.relayUpstream && config.relayPageTmpl && config.relayDefsKey,
   );
+}
+
+// 上游 URL 校验（安全加固 2026-11-16）：gmUrl / mediaUrl 来自上游页面内容，
+// 不是服务端构造的，必须落在上游自家域名上；裸 IP、内网地址、非 http(s) 一律拒绝。
+// 第 1 步的 pageUrl 由环境变量 + 编码后的 id 构造（可信），不走这里。
+const RELAY_ALLOWED_SUFFIXES = ["pornhub.com", "phncdn.com"];
+
+function isRelayAllowedUrl(raw: string): boolean {
+  let u: URL;
+  try {
+    u = new URL(raw);
+  } catch {
+    return false;
+  }
+  if (u.protocol !== "https:" && u.protocol !== "http:") return false;
+  if (u.username !== "" || u.password !== "") return false;
+  const host = u.hostname.toLowerCase().replace(/\.$/, "");
+  if (host === "" || host === "localhost" || host.endsWith(".localhost")) return false;
+  // 裸 IP 一律拒绝（IPv4 字面量与含冒号的 IPv6 字面量）
+  if (/^\d+\.\d+\.\d+\.\d+$/.test(host) || host.includes(":")) return false;
+  for (const s of RELAY_ALLOWED_SUFFIXES) {
+    if (host === s || host.endsWith("." + s)) return true;
+  }
+  return false;
+}
+
+// 带校验的手动重定向跟随：初始 URL 与每一跳都必须过域名白名单，最多 3 跳。
+// timeoutMs 为空时不设超时（取流是大文件流式传输，不能用固定超时掐断）。
+async function fetchRelay(url: string, init: RequestInit, timeoutMs?: number): Promise<Response> {
+  let current = url;
+  for (let hop = 0; hop <= 3; hop++) {
+    if (!isRelayAllowedUrl(current)) {
+      throw new Error("relay: disallowed url");
+    }
+    const res = await fetch(current, {
+      ...init,
+      ...(timeoutMs ? { signal: AbortSignal.timeout(timeoutMs) } : {}),
+      redirect: "manual",
+    });
+    if (
+      res.status === 301 ||
+      res.status === 302 ||
+      res.status === 303 ||
+      res.status === 307 ||
+      res.status === 308
+    ) {
+      const loc = res.headers.get("location");
+      await res.arrayBuffer().catch(() => undefined);
+      if (!loc) throw new Error("relay: redirect without location");
+      current = new URL(loc, current).toString();
+      continue;
+    }
+    return res;
+  }
+  throw new Error("relay: too many redirects");
 }
 
 // 从 HTML 里按括号匹配取出 key 对应的 JSON 数组（只从针位起扫描，不扫整页）。
@@ -133,11 +190,7 @@ export function registerRelay(app: Hono): void {
     if (cookie) gmHeaders["Cookie"] = cookie;
     let gmRes: Response;
     try {
-      gmRes = await fetch(gmUrl, {
-        headers: gmHeaders,
-        signal: AbortSignal.timeout(PAGE_TIMEOUT_MS),
-        redirect: "follow",
-      });
+      gmRes = await fetchRelay(gmUrl, { headers: gmHeaders }, PAGE_TIMEOUT_MS);
     } catch {
       return fail("media");
     }
@@ -176,11 +229,11 @@ export function registerRelay(app: Hono): void {
       if (startPos <= RANGE_STEP) return;
       for (let pos = RANGE_STEP; pos < startPos; pos += RANGE_STEP) {
         try {
-          const probe = await fetch(mediaUrl, {
-            headers: { "User-Agent": UA, Referer: upstream + "/", Range: `bytes=${pos}-${pos}` },
-            signal: AbortSignal.timeout(PAGE_TIMEOUT_MS),
-            redirect: "follow",
-          });
+          const probe = await fetchRelay(
+            mediaUrl,
+            { headers: { "User-Agent": UA, Referer: upstream + "/", Range: `bytes=${pos}-${pos}` } },
+            PAGE_TIMEOUT_MS,
+          );
           await probe.arrayBuffer().catch(() => undefined);
           if (probe.status !== 206) break;
         } catch {
@@ -192,7 +245,7 @@ export function registerRelay(app: Hono): void {
     for (let attempt = 0; attempt < 3; attempt++) {
       await walk();
       try {
-        up = await fetch(mediaUrl, { headers: mediaHeaders, redirect: "follow" });
+        up = await fetchRelay(mediaUrl, { headers: mediaHeaders });
       } catch {
         up = null;
       }
@@ -207,6 +260,8 @@ export function registerRelay(app: Hono): void {
       if (v) headers.set(name, v);
     }
     headers.set("Access-Control-Allow-Origin", "*");
+    // 部署标记：验证新版是否上线时用（rev 2 = 含上游 URL 校验的版本）
+    headers.set("X-Relay-Rev", "2");
     return new Response(up.body, { status: up.status, headers });
   });
 }
